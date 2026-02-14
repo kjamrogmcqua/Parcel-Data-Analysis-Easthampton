@@ -1,0 +1,361 @@
+---
+title: "Easthampton Parcel Data Analysis"
+author: "Kiam Jamrog-McQuaid"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 8, dpi = 300)
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+library(tidyverse)
+library(sf)
+library(scales)
+library(here)
+library(writexl)
+```
+
+# Notes
+
+This notebook reads a MassGIS Level 3 Assessor parcel geodatabase (.gdb),
+joins parcel geometry to assessment attributes, produces choropleth maps,
+and exports the result to portable formats. It is written as a reusable
+template — swap in any Massachusetts municipality's M-series GDB to adapt.
+
+## Reference Objects
+
+```{r}
+
+# Custom palettes for parcel maps
+pal_value <- c(low = "#FCFDBF", mid = "#B63679", high = "#000004")   # assessed value
+pal_green <- c(low = "#F0F9E8", mid = "#43A2CA", high = "#0868AC")   # value per acre
+pal_warm  <- c(low = "#FEE8C8", mid = "#E34A33", high = "#67000D")   # building value
+
+# Create output directory
+dir.create(here("output", "maps"), recursive = TRUE, showWarnings = FALSE)
+
+# GDB path — update this if using a different municipality
+gdb_path <- here("data", "gdb", "M087_parcels_CY25_FY25_sde.gdb")
+
+```
+
+# Reading Geodatabase
+
+## Inspect Layers
+
+```{r}
+
+layers <- st_layers(gdb_path)
+print(layers)
+
+```
+
+## Read All Layers
+
+```{r}
+
+# Spatial layers
+taxpar <- st_read(gdb_path, layer = "M087TaxPar", quiet = TRUE)
+othleg <- st_read(gdb_path, layer = "M087OthLeg", quiet = TRUE)
+
+# Non-spatial (attribute) tables
+assess <- st_read(gdb_path, layer = "M087Assess", quiet = TRUE)
+lut    <- st_read(gdb_path, layer = "M087_LUT",   quiet = TRUE)
+uc_lut <- st_read(gdb_path, layer = "M087UC_LUT", quiet = TRUE)
+
+```
+
+## Linearize Curved Geometries
+
+ESRI geodatabases can contain MULTISURFACE and CURVEPOLYGON geometry types
+(arc segments). These must be linearized to standard MULTIPOLYGON for
+GeoPackage export and ggplot2 rendering.
+
+```{r}
+
+taxpar <- st_cast(taxpar, "MULTIPOLYGON")
+othleg <- st_cast(othleg, "MULTIPOLYGON")
+
+```
+
+## Layer Summaries
+
+```{r}
+
+cat("=== TaxPar (parcel geometry) ===\n")
+cat("Features:", nrow(taxpar), "| CRS:", st_crs(taxpar)$input, "\n")
+cat("Columns:", paste(names(taxpar), collapse = ", "), "\n\n")
+
+cat("=== Assess (property attributes) ===\n")
+cat("Rows:", nrow(assess), "\n")
+cat("Columns:", paste(names(assess), collapse = ", "), "\n\n")
+
+cat("=== Use Code Lookup ===\n")
+cat("Rows:", nrow(uc_lut), "\n")
+print(head(uc_lut, 10))
+
+cat("\n=== Other Lookups ===\n")
+print(lut)
+
+```
+
+# Join & Build Analysis Dataset
+
+## Join TaxPar Geometry to Assessment Data
+
+```{r}
+
+# Join key: TaxPar.MAP_PAR_ID == Assess.PROP_ID
+# Left join preserves all geometry rows
+parcels <- taxpar %>%
+  left_join(
+    assess %>% select(-any_of(c("TOWN_ID", "Shape"))),
+    by = c("MAP_PAR_ID" = "PROP_ID")
+  )
+
+# Check for duplicate rows from multi-unit parcels (condos, etc.)
+if (nrow(parcels) > nrow(taxpar)) {
+  cat("NOTE: Join produced", nrow(parcels) - nrow(taxpar),
+      "extra rows (likely condo/multi-unit parcels).\n")
+}
+
+cat("Joined dataset:", nrow(parcels), "features,", ncol(parcels), "columns\n")
+
+```
+
+## Join Use Code Descriptions
+
+```{r}
+
+uc_lookup <- uc_lut %>%
+  select(USE_CODE, USE_DESC) %>%
+  distinct(USE_CODE, .keep_all = TRUE)
+
+parcels <- parcels %>%
+  left_join(uc_lookup, by = "USE_CODE")
+
+```
+
+## Derive Analysis Columns
+
+```{r}
+
+parcels <- parcels %>%
+  mutate(
+    # Broad land use category from first digit of USE_CODE
+    use_category = case_when(
+      substr(USE_CODE, 1, 1) == "1" ~ "Residential",
+      substr(USE_CODE, 1, 1) == "3" ~ "Commercial",
+      substr(USE_CODE, 1, 1) == "4" ~ "Industrial",
+      substr(USE_CODE, 1, 1) == "5" ~ "Personal Property",
+      substr(USE_CODE, 1, 1) == "6" ~ "Classified/Forest/Ag",
+      substr(USE_CODE, 1, 1) == "7" ~ "Exempt",
+      substr(USE_CODE, 1, 1) == "8" ~ "Exempt (State/Federal)",
+      substr(USE_CODE, 1, 1) == "9" ~ "Exempt (Municipal/Other)",
+      substr(USE_CODE, 1, 1) == "0" ~ "Mixed Use",
+      TRUE ~ "Other"
+    ),
+    # Normalize lot size to acres
+    lot_acres = case_when(
+      LOT_UNITS == "A" ~ LOT_SIZE,
+      LOT_UNITS == "S" ~ LOT_SIZE / 43560,
+      TRUE ~ NA_real_
+    ),
+    # Value per acre
+    val_per_acre = if_else(lot_acres > 0, TOTAL_VAL / lot_acres, NA_real_),
+    # Log-transformed total value (useful for mapping skewed distributions)
+    log_total_val = log10(pmax(TOTAL_VAL, 1))
+  )
+
+```
+
+## Diagnostics
+
+```{r}
+
+cat("Use category distribution:\n")
+print(table(parcels$use_category, useNA = "ifany"))
+
+cat("\nValue summary:\n")
+print(summary(parcels$TOTAL_VAL))
+
+cat("\nLot size (acres) summary:\n")
+print(summary(parcels$lot_acres))
+
+```
+
+# Choropleth Maps
+
+## Total Assessed Value
+
+```{r}
+
+p_total_value <- ggplot(parcels) +
+  geom_sf(aes(fill = TOTAL_VAL), linewidth = 0.05, color = "white") +
+  scale_fill_gradient2(
+    name     = "Total value",
+    labels   = scales::dollar_format(),
+    low      = pal_value["low"],
+    mid      = pal_value["mid"],
+    high     = pal_value["high"],
+    midpoint = log10(400000),
+    trans    = "log10",
+    na.value = "grey90"
+  ) +
+  coord_sf(crs = st_crs(parcels)) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  ) +
+  ggtitle("Total Assessed Value by Parcel — Easthampton")
+
+p_total_value
+
+ggsave(
+  filename = here("output", "maps", "total_value_choropleth.png"),
+  plot = p_total_value,
+  width = 10, height = 8, dpi = 300
+)
+
+```
+
+## Land Use Category
+
+```{r}
+
+p_land_use <- ggplot(parcels) +
+  geom_sf(aes(fill = use_category), linewidth = 0.05, color = "white") +
+  scale_fill_viridis_d(name = "Land use") +
+  coord_sf(crs = st_crs(parcels)) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  ) +
+  ggtitle("Land Use by Parcel — Easthampton")
+
+p_land_use
+
+ggsave(
+  filename = here("output", "maps", "land_use_choropleth.png"),
+  plot = p_land_use,
+  width = 10, height = 8, dpi = 300
+)
+
+```
+
+## Residential Value per Acre
+
+```{r}
+
+parcels_res <- parcels %>%
+  filter(use_category == "Residential", !is.na(val_per_acre))
+
+p_val_per_acre <- ggplot(parcels_res) +
+  geom_sf(aes(fill = val_per_acre), linewidth = 0.05, color = "white") +
+  scale_fill_gradient2(
+    name     = "Value / acre",
+    labels   = scales::dollar_format(),
+    low      = pal_green["low"],
+    mid      = pal_green["mid"],
+    high     = pal_green["high"],
+    midpoint = log10(median(parcels_res$val_per_acre, na.rm = TRUE)),
+    trans    = "log10",
+    na.value = "grey90"
+  ) +
+  coord_sf(crs = st_crs(parcels)) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  ) +
+  ggtitle("Residential Value per Acre — Easthampton")
+
+p_val_per_acre
+
+ggsave(
+  filename = here("output", "maps", "residential_value_per_acre.png"),
+  plot = p_val_per_acre,
+  width = 10, height = 8, dpi = 300
+)
+
+```
+
+## Building Value
+
+```{r}
+
+parcels_bldg <- parcels %>%
+  filter(BLDG_VAL > 0)
+
+p_bldg_value <- ggplot(parcels_bldg) +
+  geom_sf(aes(fill = BLDG_VAL), linewidth = 0.05, color = "white") +
+  scale_fill_gradient2(
+    name     = "Building value",
+    labels   = scales::dollar_format(),
+    low      = pal_warm["low"],
+    mid      = pal_warm["mid"],
+    high     = pal_warm["high"],
+    midpoint = log10(median(parcels_bldg$BLDG_VAL, na.rm = TRUE)),
+    trans    = "log10",
+    na.value = "grey90"
+  ) +
+  coord_sf(crs = st_crs(parcels)) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  ) +
+  ggtitle("Building Value by Parcel — Easthampton")
+
+p_bldg_value
+
+ggsave(
+  filename = here("output", "maps", "building_value_choropleth.png"),
+  plot = p_bldg_value,
+  width = 10, height = 8, dpi = 300
+)
+
+```
+
+# Export
+
+## RDS (preserves geometry and R types)
+
+```{r}
+
+saveRDS(parcels, here("data", "processed", "parcels_joined.rds"))
+
+```
+
+## GeoPackage (portable spatial format)
+
+```{r}
+
+st_write(parcels, here("data", "processed", "easthampton_parcels.gpkg"),
+         layer = "parcels", delete_layer = TRUE, quiet = TRUE)
+
+```
+
+## CSV (tabular attributes only, no geometry)
+
+```{r}
+
+parcels %>%
+  st_drop_geometry() %>%
+  write.csv(here("data", "processed", "parcels_joined.csv"), row.names = FALSE)
+
+```
+
+## XLSX (tabular attributes only, no geometry)
+
+```{r}
+
+parcels %>%
+  st_drop_geometry() %>%
+  write_xlsx(here("data", "processed", "parcels_joined.xlsx"))
+
+```

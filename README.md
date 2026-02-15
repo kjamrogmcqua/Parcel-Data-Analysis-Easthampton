@@ -41,8 +41,6 @@ Parcel Data Analysis/
 install.packages(c("tidyverse", "sf", "scales", "here", "writexl", "conflicted"))
 ```
 
-The `sf` package requires GDAL, GEOS, and PROJ system libraries. On macOS: `brew install gdal`. On Ubuntu: `sudo apt install libgdal-dev`.
-
 ## Quick Start
 
 1. Clone the repo and open `Parcel Data Analysis.Rproj` in RStudio
